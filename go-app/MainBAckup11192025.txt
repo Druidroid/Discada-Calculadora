@@ -1,0 +1,510 @@
+package main
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"html/template"
+	"log"
+	"math"
+	"net/http"
+	"os"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/gin-gonic/gin"
+)
+
+const scraperBase = "http://scraper:8000/price?url="
+
+// Timeout total por request al scraper (cada ingrediente)
+const perReqTimeout = 60 * time.Second
+
+// Cache TTL de 5 minutos
+const cacheTTL = 5 * time.Minute
+
+var httpClient = &http.Client{Timeout: perReqTimeout}
+
+// -------------------- Datos de receta --------------------
+var (
+	// Total receta base (solo se usa para escalar bebidas)
+	totalBaseGrams float64 = 2937.5
+
+	// Ratios SOLO de proteínas (suman 1.0 dentro del bloque de proteínas)
+	proteinRatios = map[string]float64{
+		"Pulpa de res picada": 0.55,
+		"Tocino picado":       0.075,
+		"Jamon en cuadros":    0.175,
+		"Salchicha p/Asar":    0.125,
+		"Chorizo":             0.075,
+	}
+
+	// Cebolla: ratio separado (no influye en proteínas)
+	onionRatio float64 = 0.175
+
+	// Bebidas: cantidades base por tanda
+	baseUnits = map[string]float64{
+		"Cerveza":             3.125,
+		"Jugo de verduras V8": 1.0,
+	}
+
+	// URLs de scraping
+	ingredientURLs = map[string]string{
+		"Pulpa de res picada": "https://alsuper.com/producto/pulpa-de-res-picada-357825",
+		"Tocino picado":       "https://alsuper.com/producto/tocineta-413218",
+		"Jamon en cuadros":    "https://alsuper.com/producto/jamon-de-pierna-horneado-428669",
+		"Salchicha p/Asar":    "https://alsuper.com/producto/salchicha-para-asar-238828",
+		"Chorizo":             "https://alsuper.com/producto/chorizo-319544",
+		"Cebolla blanca":      "https://alsuper.com/producto/cebolla-blanca-924",
+		"Cerveza":             "https://alsuper.com/producto/cerveza-six-pack-lata-323328",
+		"Jugo de verduras V8": "https://alsuper.com/producto/nectar-mixto-de-450697",
+	}
+)
+
+// -------------------- Modelos --------------------
+
+type scraperPrice struct {
+	URL         string   `json:"url"`
+	ProductName *string  `json:"product_name,omitempty"`
+	PricePerKg  *float64 `json:"price_per_kg,omitempty"` // para productos a granel O (caso real) precio mostrado en página
+	UnitPrice   *float64 `json:"unit_price,omitempty"`   // para pieza/paquete/lata/six
+	Currency    string   `json:"currency"`
+}
+
+type IngredientCalc struct {
+	Name           string  `json:"name"`
+	URL            string  `json:"url"`
+	GramsNeeded    float64 `json:"grams_needed"`
+	UnitsNeeded    int     `json:"units_needed"`    // piezas/latas requeridas (visual)
+	PurchasedUnits int     `json:"purchased_units"` // paquetes/piezas/six comprados
+	PricePerKg     float64 `json:"price_per_kg"`    // visible en UI si aplica
+	UnitPrice      float64 `json:"unit_price"`      // visible en UI si aplica
+	Cost           float64 `json:"cost"`
+	Currency       string  `json:"currency"`
+}
+
+type CalcResponse struct {
+	Personas         int              `json:"personas"`
+	GramosPorPersona int              `json:"gramos_por_persona"`
+	TotalGramos      float64          `json:"total_grams"`
+	Items            []IngredientCalc `json:"items"`
+	TotalCosto       float64          `json:"total_cost"`
+	Currency         string           `json:"currency"`
+}
+
+// -------------------- Cache simple --------------------
+
+type priceEntry struct {
+	at   time.Time
+	data *scraperPrice
+}
+
+var (
+	priceCache = make(map[string]priceEntry) // key: URL
+	cacheMu    sync.RWMutex
+)
+
+func cacheGet(url string) (*scraperPrice, bool) {
+	cacheMu.RLock()
+	ent, ok := priceCache[url]
+	cacheMu.RUnlock()
+	if !ok {
+		return nil, false
+	}
+	if time.Since(ent.at) > cacheTTL {
+		return nil, false
+	}
+	return ent.data, true
+}
+
+func cacheSet(url string, pr *scraperPrice) {
+	cacheMu.Lock()
+	priceCache[url] = priceEntry{at: time.Now(), data: pr}
+	cacheMu.Unlock()
+}
+
+// -------------------- Utilidades --------------------
+
+func mustEnv(key, fallback string) string {
+	v := os.Getenv(key)
+	if v == "" {
+		return fallback
+	}
+	return v
+}
+func ceilDiv(n, d int) int {
+	if n <= 0 {
+		return 0
+	}
+	q := n / d
+	if n%d != 0 {
+		q++
+	}
+	return q
+}
+func round2(x float64) float64 {
+	return math.Round(x*100) / 100
+}
+func urlQueryEscape(s string) string {
+	return template.URLQueryEscaper(s)
+}
+
+// Llamada base al scraper (usa cache)
+func fetchPrice(ctx context.Context, url string) (*scraperPrice, error) {
+	if pr, ok := cacheGet(url); ok {
+		return pr, nil
+	}
+	req, _ := http.NewRequestWithContext(ctx, "GET", scraperBase+urlQueryEscape(url), nil)
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("llamando scraper: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 200 {
+		return nil, fmt.Errorf("scraper status %d", resp.StatusCode)
+	}
+	var pr scraperPrice
+	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+		return nil, fmt.Errorf("decode json: %w", err)
+	}
+	cacheSet(url, &pr)
+	return &pr, nil
+}
+
+// Reintentos con backoff
+func fetchWithRetry(ctx context.Context, url string, attempts int, baseDelay time.Duration) (*scraperPrice, error) {
+	var lastErr error
+	for i := 0; i < attempts; i++ {
+		attemptCtx, cancel := context.WithTimeout(ctx, perReqTimeout)
+		pr, err := fetchPrice(attemptCtx, url)
+		cancel()
+		if err == nil {
+			return pr, nil
+		}
+		lastErr = err
+		time.Sleep(baseDelay * time.Duration(i+1))
+	}
+	return nil, fmt.Errorf("fetchWithRetry: %w", lastErr)
+}
+
+// -------------------- Cálculo --------------------
+
+func calcFor(personas, gpp int) (*CalcResponse, error) {
+	if personas <= 0 || gpp <= 0 {
+		return nil, fmt.Errorf("personas y gramos por persona deben ser > 0")
+	}
+	totalGrams := float64(personas * gpp)
+
+	// Cebolla informativa por su propio ratio: grams = totalGrams * onionRatio
+	onionGrams := totalGrams * onionRatio
+
+	// Orden: proteínas + cebolla + bebidas
+	names := []string{
+		"Pulpa de res picada",
+		"Tocino picado",
+		"Jamon en cuadros",
+		"Salchicha p/Asar",
+		"Chorizo",
+		"Cebolla blanca",
+		"Cerveza",
+		"Jugo de verduras V8",
+	}
+
+	items := make([]IngredientCalc, len(names))
+	errs := make([]error, len(names))
+
+	// Scrape concurrente con retry
+	var wg sync.WaitGroup
+	wg.Add(len(names))
+
+	for idx, name := range names {
+		go func(i int, nm string) {
+			defer wg.Done()
+
+			url := ingredientURLs[nm]
+			ctx, cancel := context.WithTimeout(context.Background(), perReqTimeout)
+			defer cancel()
+
+			pr, err := fetchWithRetry(ctx, url, 3, 800*time.Millisecond)
+			if err != nil {
+				errs[i] = fmt.Errorf("%s: %w", nm, err)
+				return
+			}
+
+			// Precios crudos
+			unitPrice := 0.0
+			if pr.UnitPrice != nil {
+				unitPrice = *pr.UnitPrice
+			}
+			pricePerKg := 0.0
+			if pr.PricePerKg != nil {
+				pricePerKg = *pr.PricePerKg
+			}
+
+			it := IngredientCalc{
+				Name:       nm,
+				URL:        url,
+				Currency:   pr.Currency,
+				UnitPrice:  unitPrice,
+				PricePerKg: pricePerKg,
+			}
+
+			switch nm {
+			// ---------- Proteínas por KG ----------
+			case "Pulpa de res picada", "Tocino picado", "Jamon en cuadros":
+				r := proteinRatios[nm]
+				gramsNeeded := r * totalGrams
+				it.GramsNeeded = gramsNeeded
+				kilos := gramsNeeded / 1000.0
+				// Si llegó unit_price por error como $/kg, úsalo.
+				if it.PricePerKg <= 0 && it.UnitPrice > 0 {
+					it.PricePerKg = it.UnitPrice
+				}
+				it.UnitPrice = 0 // UI: solo mostramos $/kg
+				it.Cost = round2(kilos * it.PricePerKg)
+
+			// ---------- Paquetes (SIEMPRE Precio Unitario de PAQUETE) ----------
+			case "Salchicha p/Asar":
+				// 800 g por paquete — costo = unit_price * paquetes
+				r := proteinRatios[nm]
+				gramsNeeded := r * totalGrams
+				it.GramsNeeded = gramsNeeded
+				packs := ceilDiv(int(math.Round(gramsNeeded)), 800)
+				it.PurchasedUnits = packs
+
+				// REGLA: si unit_price viene vacío pero hay price_per_kg,
+				// tomamos price_per_kg COMO unit_price (sin multiplicar por peso).
+				if it.UnitPrice <= 0 && it.PricePerKg > 0 {
+					it.UnitPrice = it.PricePerKg
+				}
+				// Para UI: “Precio Por Kg” debe ir vacío
+				it.PricePerKg = 0
+				it.Cost = round2(float64(packs) * it.UnitPrice)
+
+			case "Chorizo":
+				// 100 g por paquete — costo = unit_price * paquetes
+				r := proteinRatios[nm]
+				gramsNeeded := r * totalGrams
+				it.GramsNeeded = gramsNeeded
+				packs := ceilDiv(int(math.Round(gramsNeeded)), 100)
+				it.PurchasedUnits = packs
+
+				// REGLA: si unit_price viene vacío pero hay price_per_kg,
+				// tomamos price_per_kg COMO unit_price (sin multiplicar por peso).
+				if it.UnitPrice <= 0 && it.PricePerKg > 0 {
+					it.UnitPrice = it.PricePerKg
+				}
+				// Para UI: “Precio Por Kg” debe ir vacío
+				it.PricePerKg = 0
+				it.Cost = round2(float64(packs) * it.UnitPrice)
+
+			// ---------- Cebolla ----------
+			case "Cebolla blanca":
+				// Por KG -> mostrar $/kg; piezas de 150 g.
+				it.GramsNeeded = onionGrams
+				const onionWeight = 150
+				onions := ceilDiv(int(math.Round(onionGrams)), onionWeight)
+				it.UnitsNeeded = onions
+				// Si llegó unit_price pero no $/kg, úsalo como $/kg
+				if it.PricePerKg <= 0 && it.UnitPrice > 0 {
+					it.PricePerKg = it.UnitPrice
+				}
+				it.UnitPrice = 0 // UI: cebolla muestra $/kg
+				it.Cost = round2(float64(onions*onionWeight) / 1000.0 * it.PricePerKg)
+
+			// ---------- Bebidas ----------
+			case "Cerveza":
+				scale := totalGrams / totalBaseGrams
+				baseLatas := baseUnits[nm] // 3.125
+				latasNecesarias := int(math.Ceil(scale * baseLatas))
+				sixPacks := 0
+				if latasNecesarias > 0 {
+					sixPacks = int(math.Ceil(float64(latasNecesarias) / 6.0))
+					if sixPacks < 1 {
+						sixPacks = 1
+					}
+				}
+				it.UnitsNeeded = latasNecesarias
+				it.PurchasedUnits = sixPacks
+				it.PricePerKg = 0
+				it.Cost = round2(float64(sixPacks) * it.UnitPrice)
+
+			case "Jugo de verduras V8":
+				scale := totalGrams / totalBaseGrams
+				baseLatas := baseUnits[nm] // 1.0
+				latas := int(math.Ceil(scale * baseLatas))
+				if latas == 0 && scale > 0 {
+					latas = 1
+				}
+				it.UnitsNeeded = latas
+				it.PurchasedUnits = latas
+				it.PricePerKg = 0
+				it.Cost = round2(float64(latas) * it.UnitPrice)
+			}
+
+			items[i] = it
+		}(idx, name)
+	}
+
+	wg.Wait()
+
+	for _, e := range errs {
+		if e != nil {
+			return nil, e
+		}
+	}
+
+	var totalCost float64
+	currency := "MXN"
+	for _, it := range items {
+		totalCost += it.Cost
+		if it.Currency != "" {
+			currency = it.Currency
+		}
+	}
+
+	out := &CalcResponse{
+		Personas:         personas,
+		GramosPorPersona: gpp,
+		TotalGramos:      round2(totalGrams),
+		Items:            items,
+		TotalCosto:       round2(totalCost),
+		Currency:         currency,
+	}
+	return out, nil
+}
+
+// -------------------- HTTP --------------------
+
+func main() {
+	ginMode := mustEnv("GIN_MODE", "debug")
+	if ginMode == "release" {
+		gin.SetMode(gin.ReleaseMode)
+	}
+	r := gin.Default()
+	r.SetTrustedProxies(nil)
+
+	r.GET("/", func(c *gin.Context) {
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(200, indexHTML)
+	})
+
+	r.GET("/api/calc", func(c *gin.Context) {
+		personas := atoiQ(c.Query("personas"))
+		gpp := atoiQ(c.Query("gpp"))
+		res, err := calcFor(personas, gpp)
+		if err != nil {
+			c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+			return
+		}
+		c.JSON(200, res)
+	})
+
+	port := mustEnv("PORT", "8080")
+	log.Printf("Go app escuchando en :%s", port)
+	if err := r.Run(":" + port); err != nil {
+		log.Fatal(err)
+	}
+}
+
+func atoiQ(s string) int {
+	var n int
+	fmt.Sscanf(strings.TrimSpace(s), "%d", &n)
+	return n
+}
+
+// -------------------- UI simple --------------------
+
+const indexHTML = "<!doctype html>\n" +
+	"<html lang=\"es\">\n" +
+	"<head>\n" +
+	"<meta charset=\"utf-8\" />\n" +
+	"<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />\n" +
+	"<title>Calculadora Discada Norteña</title>\n" +
+	"<style>\n" +
+	"  body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;max-width:1000px;margin:40px auto;padding:0 12px;}\n" +
+	"  h1{margin-top:0}\n" +
+	"  form{display:flex;gap:12px;flex-wrap:wrap;align-items:flex-end;margin-bottom:16px;}\n" +
+	"  label{display:flex;flex-direction:column;font-size:14px}\n" +
+	"  input[type=number]{padding:8px 10px;font-size:16px;border:1px solid #ccc;border-radius:8px;min-width:140px}\n" +
+	"  button{padding:10px 14px;border:0;background:#111;color:#fff;border-radius:10px;font-weight:600;cursor:pointer}\n" +
+	"  button:disabled{opacity:.5;cursor:default}\n" +
+	"  table{width:100%;border-collapse:collapse;margin-top:16px}\n" +
+	"  th,td{padding:8px 10px;border-bottom:1px solid #eee;text-align:right}\n" +
+	"  th:first-child, td:first-child {text-align:left}\n" +
+	"  tfoot td{font-weight:700}\n" +
+	"</style>\n" +
+	"</head>\n" +
+	"<body>\n" +
+	"  <h1>Calculadora de Discada Norteña</h1>\n" +
+	"  <form id=\"f\">\n" +
+	"    <label>Personas\n" +
+	"      <input type=\"number\" id=\"personas\" value=\"10\" min=\"1\" />\n" +
+	"    </label>\n" +
+	"    <label>Gramos por persona\n" +
+	"      <input type=\"number\" id=\"gpp\" value=\"250\" min=\"50\" step=\"10\" />\n" +
+	"    </label>\n" +
+	"    <button id=\"btn\">Calcular</button>\n" +
+	"  </form>\n" +
+	"  <div id=\"out\"></div>\n" +
+	"<script>\n" +
+	"document.getElementById('f').addEventListener('submit', async (e)=>{\n" +
+	"  e.preventDefault();\n" +
+	"  const personas = parseInt(document.getElementById('personas').value||'0',10);\n" +
+	"  const gpp = parseInt(document.getElementById('gpp').value||'0',10);\n" +
+	"  const btn = document.getElementById('btn');\n" +
+	"  const out = document.getElementById('out');\n" +
+	"  btn.disabled = true;\n" +
+	"  btn.textContent = 'Calculando...';\n" +
+	"  out.innerHTML = '';\n" +
+	"  try{\n" +
+	"    const res = await fetch('/api/calc?personas='+encodeURIComponent(personas)+'&gpp='+encodeURIComponent(gpp));\n" +
+	"    const data = await res.json();\n" +
+	"    if(!res.ok){ throw new Error((data && data.error) ? data.error : ('HTTP '+res.status)); }\n" +
+	"    const rows = data.items.map(it => {\n" +
+	"      let unidades = '';\n" +
+	"      const name = (it.name||'').toLowerCase();\n" +
+	"      if(name.includes('cerveza')){\n" +
+	"        const latas = it.units_needed || 0;\n" +
+	"        const six = it.purchased_units || 0;\n" +
+	"        unidades = latas + ' lat • ' + six + ' six';\n" +
+	"      } else if(name.includes('jugo de verduras v8')){\n" +
+	"        const latas = it.units_needed || it.purchased_units || 0;\n" +
+	"        unidades = latas + ' lat';\n" +
+	"      } else if(name.includes('salchicha')){\n" +
+	"        const g = Number(it.grams_needed||0).toFixed(0);\n" +
+	"        const pkg = it.purchased_units || 0;\n" +
+	"        unidades = g + ' g \\u2192 ' + pkg + ' pkg';\n" +
+	"      } else if(name.includes('chorizo')){\n" +
+	"        const g = Number(it.grams_needed||0).toFixed(0);\n" +
+	"        const pkg = it.purchased_units || 0;\n" +
+	"        unidades = g + ' g \\u2192 ' + pkg + ' pkg';\n" +
+	"      } else if(name.includes('cebolla blanca')){\n" +
+	"        const pza = it.units_needed || 0;\n" +
+	"        unidades = pza + ' pza';\n" +
+	"      } else {\n" +
+	"        unidades = '';\n" +
+	"      }\n" +
+	"      const precioKg = (it.price_per_kg && it.price_per_kg > 0) ? ('$'+Number(it.price_per_kg).toFixed(2)) : '-';\n" +
+	"      const precioUnit = (it.unit_price && it.unit_price > 0) ? ('$'+Number(it.unit_price).toFixed(2)) : '-';\n" +
+	"      return '<tr>'+\n" +
+	"        '<td><a href=\"'+it.url+'\" target=\"_blank\">'+it.name+'</a></td>'+\n" +
+	"        '<td>'+Number(it.grams_needed||0).toFixed(0)+' g</td>'+\n" +
+	"        '<td>'+unidades+'</td>'+\n" +
+	"        '<td>'+precioKg+'</td>'+\n" +
+	"        '<td>'+precioUnit+'</td>'+\n" +
+	"        '<td>$'+Number(it.cost||0).toFixed(2)+'</td>'+\n" +
+	"      '</tr>';\n" +
+	"    }).join('');\n" +
+	"    out.innerHTML = '<table><thead><tr><th>Ingrediente</th><th>Gramos</th><th>Unidades</th><th>Precio Por Kg</th><th>Precio Unitario</th><th>Costo</th></tr></thead><tbody>'+rows+'</tbody><tfoot><tr><td colspan=\"5\" style=\"text-align:right\">Total ('+data.currency+')</td><td>$'+Number(data.total_cost).toFixed(2)+'</td></tr></tfoot></table>';\n" +
+	"  }catch(err){\n" +
+	"    out.innerHTML = '<pre style=\\\"color:#b00;background:#fee;padding:10px;border-radius:8px\\\">'+String(err)+'</pre>';\n" +
+	"  }finally{\n" +
+	"    btn.disabled = false;\n" +
+	"    btn.textContent = 'Calcular';\n" +
+	"  }\n" +
+	"});\n" +
+	"</script>\n" +
+	"</body>\n" +
+	"</html>\n"

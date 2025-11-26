@@ -1,0 +1,324 @@
+
+package main
+
+import (
+    "encoding/json"
+    "fmt"
+    "html/template"
+    "log"
+    "math"
+    "net/http"
+    "os"
+    "strconv"
+    "time"
+
+    "github.com/gin-gonic/gin"
+    "github.com/patrickmn/go-cache"
+)
+
+type Ingredient struct {
+    Key          string  `json:"key"`
+    Name         string  `json:"name"`
+    BaseGrams    float64 `json:"base_grams"`
+    UnitType     string  `json:"unit_type"` // "kg" | "aux"
+    URL          string  `json:"url"`
+    BaseUnits    float64 `json:"base_units"`
+    Notes        string  `json:"notes,omitempty"`
+}
+
+type PriceResponse struct {
+    URL          string   `json:"url"`
+    ProductName  *string  `json:"product_name"`
+    PricePerKg   *float64 `json:"price_per_kg"`
+    UnitPrice    *float64 `json:"unit_price"`
+    UnitPackSize *int     `json:"unit_pack_size"`
+    Currency     string   `json:"currency"`
+    RawUnit      *string  `json:"raw_unit"`
+}
+
+var ingredients = []Ingredient{
+    {"pulpa_res","Pulpa de res picada",1375.0,"kg","https://alsuper.com/producto/pulpa-de-res-picada-357825",0,""},
+    {"tocino","Tocino picado",187.5,"kg","https://alsuper.com/producto/tocineta-413218",0,""},
+    {"jamon","Jamón en cuadros",437.5,"kg","https://alsuper.com/producto/jamon-de-pierna-horneado-428669",0,""},
+    {"salchicha","Salchicha para asar",312.5,"kg","https://alsuper.com/producto/salchicha-para-asar-238828",0,""},
+    {"chorizo","Chorizo",187.5,"kg","https://alsuper.com/producto/chorizo-319544",0,""},
+    {"cebolla","Cebolla blanca",437.5,"kg","https://alsuper.com/producto/cebolla-blanca-924",0,""},
+    {"cerveza","Cerveza (six-pack de latas)",0,"aux","https://alsuper.com/producto/cerveza-six-pack-lata-323328",4,"Se vende por six-pack (6 latas). Precio por lata = precio del paquete / 6."},
+    {"v8","Jugo V8 (lata)",0,"aux","https://alsuper.com/producto/nectar-mixto-de-450697",1,"Se vende por lata."},
+}
+
+const baseTotalGrams = 2937.5
+
+var priceCache = cache.New(5*time.Minute, 6*time.Minute)
+
+func scraperURL() string {
+    if v := os.Getenv("SCRAPER_URL"); v != "" {
+        return v
+    }
+    return "http://scraper:8000/price"
+}
+
+func fetchPrice(u string) (*PriceResponse, error) {
+    if v, ok := priceCache.Get(u); ok {
+        pr := v.(PriceResponse)
+        return &pr, nil
+    }
+    req, _ := http.NewRequest("GET", scraperURL(), nil)
+    q := req.URL.Query()
+    q.Add("url", u)
+    req.URL.RawQuery = q.Encode()
+
+    client := &http.Client{Timeout: 60  * time.Second}
+    resp, err := client.Do(req)
+    if err != nil {
+        return nil, fmt.Errorf("scraper error: %w", err)
+    }
+    defer resp.Body.Close()
+    if resp.StatusCode != 200 {
+        return nil, fmt.Errorf("scraper status %d", resp.StatusCode)
+    }
+    var pr PriceResponse
+    if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
+        return nil, fmt.Errorf("decode error: %w", err)
+    }
+    priceCache.Set(u, pr, cache.DefaultExpiration)
+    return &pr, nil
+}
+
+type LineOut struct {
+    Key          string   `json:"key"`
+    Name         string   `json:"name"`
+    URL          string   `json:"url"`
+    UnitType     string   `json:"unit_type"`
+    NeededKg     *float64 `json:"needed_kg,omitempty"`
+    NeededUnits  *int     `json:"needed_units,omitempty"`
+    PricePerKg   *float64 `json:"price_per_kg,omitempty"`
+    UnitPrice    *float64 `json:"unit_price,omitempty"`
+    UnitPackSize *int     `json:"unit_pack_size,omitempty"`
+    LineCost     float64  `json:"line_cost"`
+    Notes        string   `json:"notes,omitempty"`
+}
+
+type CalcResponse struct {
+    Persons        int       `json:"persons"`
+    GramsPerPerson float64   `json:"grams_per_person"`
+    TotalGrams     float64   `json:"total_grams"`
+    Items          []LineOut `json:"items"`
+    TotalCost      float64   `json:"total_cost"`
+    Currency       string    `json:"currency"`
+}
+
+func ceilInt(v float64) int { return int(math.Ceil(v)) }
+func round2(f float64) float64 { return math.Round(f*100) / 100 }
+
+func calculate(persons int, gpp float64) (*CalcResponse, error) {
+    totalGrams := float64(persons) * gpp
+    factor := totalGrams / baseTotalGrams
+
+    out := &CalcResponse{Persons: persons, GramsPerPerson: gpp, TotalGrams: round2(totalGrams), Currency: "MXN"}
+    var total float64
+
+    for _, ing := range ingredients {
+        pr, err := fetchPrice(ing.URL)
+        if err != nil {
+            return nil, fmt.Errorf("no se pudo obtener precio de %s: %w", ing.Name, err)
+        }
+
+        lo := LineOut{Key: ing.Key, Name: ing.Name, URL: ing.URL, UnitType: ing.UnitType, Notes: ing.Notes}
+
+        switch ing.UnitType {
+        case "kg":
+            neededGrams := ing.BaseGrams * factor
+            neededKg := round2(neededGrams / 1000.0)
+            lo.NeededKg = &neededKg
+
+            var ppk float64
+            if pr.PricePerKg != nil {
+                ppk = *pr.PricePerKg
+            } else if pr.UnitPrice != nil && pr.RawUnit != nil && (*pr.RawUnit == "kg") {
+                ppk = *pr.UnitPrice
+            } else {
+                if pr.UnitPrice != nil && pr.UnitPackSize != nil && *pr.UnitPackSize == 1 {
+                    ppk = *pr.UnitPrice
+                } else {
+                    return nil, fmt.Errorf("precio por kg no disponible para %s", ing.Name)
+                }
+            }
+            ppk = round2(ppk)
+            lo.PricePerKg = &ppk
+            lo.LineCost = round2(neededKg * ppk)
+
+        case "aux":
+            neededUnits := ing.BaseUnits * factor
+            unitsCeil := ceilInt(neededUnits)
+
+            var unitPrice float64
+            packSize := 1
+            if pr.UnitPackSize != nil && *pr.UnitPackSize > 0 {
+                packSize = *pr.UnitPackSize
+            }
+            if pr.UnitPrice != nil {
+                unitPrice = *pr.UnitPrice
+            } else if pr.PricePerKg != nil {
+                unitPrice = *pr.PricePerKg
+            } else {
+                return nil, fmt.Errorf("precio unitario no disponible para %s", ing.Name)
+            }
+
+            if packSize > 1 {
+                packsNeeded := ceilInt(float64(unitsCeil) / float64(packSize))
+                lo.UnitPackSize = &packSize
+                perPiece := round2(unitPrice / float64(packSize))
+                lo.UnitPrice = &perPiece
+                lo.NeededUnits = &unitsCeil
+                lo.LineCost = round2(float64(packsNeeded) * unitPrice)
+            } else {
+                lo.NeededUnits = &unitsCeil
+                lo.UnitPrice = &unitPrice
+                lo.LineCost = round2(float64(unitsCeil) * unitPrice)
+            }
+
+        default:
+            return nil, fmt.Errorf("unit type desconocido: %s", ing.UnitType)
+        }
+
+        total += lo.LineCost
+        out.Items = append(out.Items, lo)
+    }
+    out.TotalCost = round2(total)
+    return out, nil
+}
+
+var pageTmpl = template.Must(template.New("index").Parse(`<!doctype html>
+<html lang="es">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width,initial-scale=1"/>
+<title>Calculadora de Discada Norteña</title>
+<style>
+body { font-family: system-ui, sans-serif; margin: 2rem; }
+input { padding: .5rem; font-size: 1rem; }
+button { padding: .5rem 1rem; font-size: 1rem; cursor: pointer; }
+table { border-collapse: collapse; width: 100%; margin-top: 1rem; }
+th, td { border: 1px solid #ddd; padding: .5rem; text-align: left; }
+th { background: #fafafa; }
+.small { color: #666; font-size: .85rem; }
+</style>
+</head>
+<body>
+<h1>Calculadora de Discada Norteña</h1>
+<form id="f">
+  <label>Personas: <input type="number" name="personas" min="1" value="10" required></label>
+  <label>Gramos por persona: <input type="number" name="gpp" min="50" step="50" value="250" required></label>
+  <button type="submit">Calcular</button>
+</form>
+
+<div id="out" class="small">Ingresa valores y calcula.</div>
+
+<script>
+const form = document.getElementById('f');
+const out = document.getElementById('out');
+
+form.addEventListener('submit', async (e) => {
+  e.preventDefault();
+  const fd = new FormData(form);
+  const personas = fd.get('personas');
+  const gpp = fd.get('gpp');
+  out.innerHTML = 'Calculando...';
+
+  // IMPORTANTE: sin backticks; usamos concatenación clásica
+  const url = '/api/calc?personas=' + encodeURIComponent(personas) + '&gpp=' + encodeURIComponent(gpp);
+  const res = await fetch(url);
+  if (!res.ok) {
+    out.innerHTML = 'Error al calcular.';
+    return;
+  }
+  const data = await res.json();
+
+  // Construimos HTML sin template literals
+  var html = '';
+  html += '<p><strong>Personas:</strong> ' + data.persons +
+          ' &nbsp;|&nbsp; <strong>Gramos/pp:</strong> ' + data.grams_per_person +
+          ' &nbsp;|&nbsp; <strong>Gramos totales:</strong> ' + data.total_grams + '</p>';
+
+  html += '<table><thead><tr>' +
+          '<th>Ingrediente</th>' +
+          '<th>Cantidad</th>' +
+          '<th>Precio por KG</th>' +
+          '<th>Precio unitario</th>' +
+          '<th>Costo línea</th>' +
+          '<th>Producto</th>' +
+          '</tr></thead><tbody>';
+
+  for (const it of data.items) {
+    var qty = '';
+    if (it.needed_kg !== undefined && it.needed_kg !== null) {
+      qty = it.needed_kg.toFixed(2) + ' kg';
+    } else if (it.needed_units !== undefined && it.needed_units !== null) {
+      qty = it.needed_units + ' pza.';
+      if (it.unit_pack_size) qty += ' (pack de ' + it.unit_pack_size + ')';
+    }
+    var ppk = (it.price_per_kg !== undefined && it.price_per_kg !== null) ? ('$' + it.price_per_kg.toFixed(2)) : '-';
+    var up  = (it.unit_price   !== undefined && it.unit_price   !== null) ? ('$' + it.unit_price.toFixed(2))   : '-';
+    var notes = it.notes ? ('<div class="small">' + it.notes + '</div>') : '';
+
+    html += '<tr>' +
+            '<td>' + it.name + notes + '</td>' +
+            '<td>' + qty + '</td>' +
+            '<td>' + ppk + '</td>' +
+            '<td>' + up  + '</td>' +
+            '<td>$' + it.line_cost.toFixed(2) + '</td>' +
+            '<td><a target="_blank" href="' + it.url + '">Ver en Alsuper</a></td>' +
+            '</tr>';
+  }
+
+  html += '</tbody></table>';
+  html += '<p><strong>Total estimado:</strong> $' + data.total_cost.toFixed(2) + ' MXN</p>';
+
+  out.innerHTML = html;
+});
+</script>
+</body>
+</html>`))
+
+
+func main() {
+    r := gin.Default()
+
+    r.SetTrustedProxies(nil)
+
+    r.GET("/", func(c *gin.Context) {
+        c.Header("Content-Type", "text/html; charset=utf-8")
+        pageTmpl.Execute(c.Writer, nil)
+    })
+
+    r.GET("/api/calc", func(c *gin.Context) {
+        personasStr := c.Query("personas")
+        gppStr := c.Query("gpp")
+        if personasStr == "" || gppStr == "" {
+            c.JSON(http.StatusBadRequest, gin.H{"error": "Faltan parámetros personas y gpp"})
+            return
+        }
+        personas, err := strconv.Atoi(personasStr)
+        if err != nil || personas <= 0 {
+            c.JSON(http.StatusBadRequest, gin.H{"error": "Personas inválido"})
+            return
+        }
+        gpp, err := strconv.ParseFloat(gppStr, 64)
+        if err != nil || gpp <= 0 {
+            c.JSON(http.StatusBadRequest, gin.H{"error": "gpp inválido"})
+            return
+        }
+        resp, err := calculate(personas, gpp)
+        if err != nil {
+            c.JSON(http.StatusBadGateway, gin.H{"error": err.Error()})
+            return
+        }
+        c.JSON(http.StatusOK, resp)
+    })
+
+    port := os.Getenv("PORT")
+    if port == "" { port = "8080" }
+    log.Printf("Go app escuchando en :%s", port)
+    r.Run("0.0.0.0:" + port)
+}

@@ -1,0 +1,22 @@
+
+version: "3.9"
+services:
+  scraper:
+    build: ./scraper
+    container_name: discada-scraper
+    environment:
+      - PYTHONDONTWRITEBYTECODE=1
+      - PYTHONUNBUFFERED=1
+    ports:
+      - "8000:8000"
+    command: uvicorn main:app --host 0.0.0.0 --port 8000
+  goapp:
+    build: ./go-app
+    container_name: discada-goapp
+    environment:
+      - SCRAPER_URL=http://scraper:8000/price
+      - PORT=8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      - scraper
