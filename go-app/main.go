@@ -16,7 +16,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-const scraperBase = "http://scraper:8000/price?url="
+const scraperBase = "https://discada-scraper.onrender.com/price?url="
 
 // Timeout total por request al scraper (cada ingrediente)
 const perReqTimeout = 60 * time.Second
