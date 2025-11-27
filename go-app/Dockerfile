@@ -1,31 +1,32 @@
-# Etapa de compilación
 FROM golang:1.22 AS build
-
 WORKDIR /app
 
-# Copiamos los archivos de Go
-COPY . .
-
-# Resolvemos dependencias
+# Módulos
+COPY go.mod go.sum ./
 RUN go mod tidy
 
-# Compilamos binario estático para Linux
+# Código + static
+COPY . .
+
+# Compila el binario (ruta absoluta /discada)
 RUN CGO_ENABLED=0 GOOS=linux go build -o /discada
 
-# Etapa final: runtime mínimo pero con certificados TLS
+# ---- Imagen final ----
 FROM debian:bookworm-slim
+WORKDIR /app
 
-# 🔑 INSTALAR CERTIFICADOS DE CA PARA HTTPS
+# Necesario para confiar en certificados HTTPS (scraper en Render)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ca-certificates && \
     rm -rf /var/lib/apt/lists/*
 
-WORKDIR /app
-
-# Copiar binario y estáticos
+# Binario compilado
 COPY --from=build /discada /discada
-COPY --from=build /static ./static
+
+# Carpeta static (eldorado.png, etc.)
+COPY --from=build /app/static ./static
 
 EXPOSE 8080
+ENTRYPOINT ["/discada"]
 
-CMD ["/discada"]
+
