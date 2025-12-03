@@ -229,143 +229,129 @@ func calcFor(personas, gpp int) (*CalcResponse, error) {
 		"Jugo de verduras V8",
 	}
 
-	items := make([]IngredientCalc, len(names))
-	errs := make([]error, len(names))
+	items := make([]IngredientCalc, 0, len(names))
 
-	var wg sync.WaitGroup
-	wg.Add(len(names))
+	for _, nm := range names {
+		url := ingredientURLs[nm]
 
-	for idx, name := range names {
-		go func(i int, nm string) {
-			defer wg.Done()
-
-			url := ingredientURLs[nm]
-			ctx, cancel := context.WithTimeout(context.Background(), perReqTimeout)
-			defer cancel()
-
-			pr, err := fetchWithRetry(ctx, url, 3, 800*time.Millisecond)
-			if err != nil {
-				errs[i] = fmt.Errorf("%s: %w", nm, err)
-				return
-			}
-
-			// Precios crudos del scraper
-			unitPrice := 0.0
-			if pr.UnitPrice != nil {
-				unitPrice = *pr.UnitPrice
-			}
-			pricePerKg := 0.0
-			if pr.PricePerKg != nil {
-				pricePerKg = *pr.PricePerKg
-			}
-
-			it := IngredientCalc{
-				Name:       nm,
-				URL:        url,
-				Currency:   pr.Currency,
-				UnitPrice:  unitPrice,
-				PricePerKg: pricePerKg,
-			}
-
-			switch nm {
-			// ---------- Proteínas por KG ----------
-			case "Pulpa de res picada", "Tocino picado", "Jamon en cuadros":
-				r := proteinRatios[nm]
-				gramsNeeded := r * totalGrams
-				it.GramsNeeded = gramsNeeded
-				kilos := gramsNeeded / 1000.0
-				// Si llegó unit_price pero no price_per_kg, úsalo como $/kg
-				if it.PricePerKg <= 0 && it.UnitPrice > 0 {
-					it.PricePerKg = it.UnitPrice
-				}
-				it.UnitPrice = 0 // UI: solo mostramos $/kg
-				it.Cost = round2(kilos * it.PricePerKg)
-
-			// ---------- Paquetes: Salchicha y Chorizo ----------
-			case "Salchicha p/Asar":
-				// 800 g por paquete — Costo = Precio Unitario × paquetes
-				r := proteinRatios[nm]
-				gramsNeeded := r * totalGrams
-				it.GramsNeeded = gramsNeeded
-				packs := ceilDiv(int(math.Round(gramsNeeded)), 800)
-				it.PurchasedUnits = packs
-
-				// Si unit_price viene vacío pero hay price_per_kg,
-				// tomar price_per_kg como unit_price (precio del paquete)
-				if it.UnitPrice <= 0 && it.PricePerKg > 0 {
-					it.UnitPrice = it.PricePerKg
-				}
-				// Columna Precio Por Kg vacía
-				it.PricePerKg = 0
-				it.Cost = round2(float64(packs) * it.UnitPrice)
-
-			case "Chorizo":
-				// 100 g por paquete — Costo = Precio Unitario × paquetes
-				r := proteinRatios[nm]
-				gramsNeeded := r * totalGrams
-				it.GramsNeeded = gramsNeeded
-				packs := ceilDiv(int(math.Round(gramsNeeded)), 100)
-				it.PurchasedUnits = packs
-
-				if it.UnitPrice <= 0 && it.PricePerKg > 0 {
-					it.UnitPrice = it.PricePerKg
-				}
-				it.PricePerKg = 0
-				it.Cost = round2(float64(packs) * it.UnitPrice)
-
-			// ---------- Cebolla ----------
-			case "Cebolla blanca":
-				// Por KG, mostrar $/kg, piezas 150g
-				it.GramsNeeded = onionGrams
-				const onionWeight = 150
-				onions := ceilDiv(int(math.Round(onionGrams)), onionWeight)
-				it.UnitsNeeded = onions
-				if it.PricePerKg <= 0 && it.UnitPrice > 0 {
-					it.PricePerKg = it.UnitPrice
-				}
-				it.UnitPrice = 0
-				it.Cost = round2(float64(onions*onionWeight) / 1000.0 * it.PricePerKg)
-
-			// ---------- Bebidas ----------
-			case "Cerveza":
-				scale := totalGrams / totalBaseGrams
-				baseLatas := baseUnits[nm] // 3.125
-				latasNecesarias := int(math.Ceil(scale * baseLatas))
-				sixPacks := 0
-				if latasNecesarias > 0 {
-					sixPacks = int(math.Ceil(float64(latasNecesarias) / 6.0))
-					if sixPacks < 1 {
-						sixPacks = 1
-					}
-				}
-				it.UnitsNeeded = latasNecesarias
-				it.PurchasedUnits = sixPacks
-				it.PricePerKg = 0
-				it.Cost = round2(float64(sixPacks) * it.UnitPrice)
-
-			case "Jugo de verduras V8":
-				scale := totalGrams / totalBaseGrams
-				baseLatas := baseUnits[nm]
-				latas := int(math.Ceil(scale * baseLatas))
-				if latas == 0 && scale > 0 {
-					latas = 1
-				}
-				it.UnitsNeeded = latas
-				it.PurchasedUnits = latas
-				it.PricePerKg = 0
-				it.Cost = round2(float64(latas) * it.UnitPrice)
-			}
-
-			items[i] = it
-		}(idx, name)
-	}
-
-	wg.Wait()
-
-	for _, e := range errs {
-		if e != nil {
-			return nil, e
+		// Contexto con timeout para ESTE ingrediente
+		ctx, cancel := context.WithTimeout(context.Background(), perReqTimeout)
+		pr, err := fetchWithRetry(ctx, url, 3, 800*time.Millisecond)
+		cancel()
+		if err != nil {
+			// Esto es lo que ves en el <div class="toast">
+			return nil, fmt.Errorf("%s: %w", nm, err)
 		}
+
+		// Precios crudos del scraper
+		unitPrice := 0.0
+		if pr.UnitPrice != nil {
+			unitPrice = *pr.UnitPrice
+		}
+		pricePerKg := 0.0
+		if pr.PricePerKg != nil {
+			pricePerKg = *pr.PricePerKg
+		}
+
+		it := IngredientCalc{
+			Name:       nm,
+			URL:        url,
+			Currency:   pr.Currency,
+			UnitPrice:  unitPrice,
+			PricePerKg: pricePerKg,
+		}
+
+		switch nm {
+		// ---------- Proteínas por KG ----------
+		case "Pulpa de res picada", "Tocino picado", "Jamon en cuadros":
+			r := proteinRatios[nm]
+			gramsNeeded := r * totalGrams
+			it.GramsNeeded = gramsNeeded
+			kilos := gramsNeeded / 1000.0
+
+			// Si llegó unit_price pero no price_per_kg, úsalo como $/kg
+			if it.PricePerKg <= 0 && it.UnitPrice > 0 {
+				it.PricePerKg = it.UnitPrice
+			}
+			it.UnitPrice = 0 // UI: solo mostramos $/kg
+			it.Cost = round2(kilos * it.PricePerKg)
+
+		// ---------- Paquetes: Salchicha y Chorizo ----------
+		case "Salchicha p/Asar":
+			// 800 g por paquete — Costo = Precio Unitario × paquetes
+			r := proteinRatios[nm]
+			gramsNeeded := r * totalGrams
+			it.GramsNeeded = gramsNeeded
+			packs := ceilDiv(int(math.Round(gramsNeeded)), 800)
+			it.PurchasedUnits = packs
+
+			// Si unit_price viene vacío pero hay price_per_kg,
+			// tomar price_per_kg como unit_price (precio del paquete)
+			if it.UnitPrice <= 0 && it.PricePerKg > 0 {
+				it.UnitPrice = it.PricePerKg
+			}
+			// Columna Precio Por Kg vacía
+			it.PricePerKg = 0
+			it.Cost = round2(float64(packs) * it.UnitPrice)
+
+		case "Chorizo":
+			// 100 g por paquete — Costo = Precio Unitario × paquetes
+			r := proteinRatios[nm]
+			gramsNeeded := r * totalGrams
+			it.GramsNeeded = gramsNeeded
+			packs := ceilDiv(int(math.Round(gramsNeeded)), 100)
+			it.PurchasedUnits = packs
+
+			if it.UnitPrice <= 0 && it.PricePerKg > 0 {
+				it.UnitPrice = it.PricePerKg
+			}
+			it.PricePerKg = 0
+			it.Cost = round2(float64(packs) * it.UnitPrice)
+
+		// ---------- Cebolla ----------
+		case "Cebolla blanca":
+			// Por KG, mostrar $/kg, piezas 150g
+			it.GramsNeeded = onionGrams
+			const onionWeight = 150
+			onions := ceilDiv(int(math.Round(onionGrams)), onionWeight)
+			it.UnitsNeeded = onions
+			if it.PricePerKg <= 0 && it.UnitPrice > 0 {
+				it.PricePerKg = it.UnitPrice
+			}
+			it.UnitPrice = 0
+			it.Cost = round2(float64(onions*onionWeight) / 1000.0 * it.PricePerKg)
+
+		// ---------- Bebidas ----------
+		case "Cerveza":
+			scale := totalGrams / totalBaseGrams
+			baseLatas := baseUnits[nm] // 3.125
+			latasNecesarias := int(math.Ceil(scale * baseLatas))
+			sixPacks := 0
+			if latasNecesarias > 0 {
+				sixPacks = int(math.Ceil(float64(latasNecesarias) / 6.0))
+				if sixPacks < 1 {
+					sixPacks = 1
+				}
+			}
+			it.UnitsNeeded = latasNecesarias
+			it.PurchasedUnits = sixPacks
+			it.PricePerKg = 0
+			it.Cost = round2(float64(sixPacks) * it.UnitPrice)
+
+		case "Jugo de verduras V8":
+			scale := totalGrams / totalBaseGrams
+			baseLatas := baseUnits[nm]
+			latas := int(math.Ceil(scale * baseLatas))
+			if latas == 0 && scale > 0 {
+				latas = 1
+			}
+			it.UnitsNeeded = latas
+			it.PurchasedUnits = latas
+			it.PricePerKg = 0
+			it.Cost = round2(float64(latas) * it.UnitPrice)
+		}
+
+		items = append(items, it)
 	}
 
 	var totalCost float64
