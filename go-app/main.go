@@ -2,14 +2,15 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
-	"encoding/json"
 	"fmt"
 	"html/template"
+	"io"
 	"log"
 	"math"
 	"net/http"
 	"os"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -17,24 +18,13 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
-// En producción (Render) apuntamos al scraper público HTTPS
-const scraperBase = "https://discada-scraper-1.onrender.com/price?url="
-
-// Timeout total por request al scraper (cada ingrediente)
+// Timeout total por request (por ingrediente)
 const perReqTimeout = 60 * time.Second
 
 // Cache TTL de 5 minutos
 const cacheTTL = 5 * time.Minute
 
-// Cliente HTTP con timeout y TLS relajado (para evitar error x509 en Render)
-var httpClient = &http.Client{
-	Timeout: perReqTimeout,
-	Transport: &http.Transport{
-		TLSClientConfig: &tls.Config{
-			InsecureSkipVerify: true, // ⚠️ Acepta el certificado del scraper sin validarlo
-		},
-	},
-}
+var httpClient = &http.Client{Timeout: perReqTimeout}
 
 // -------------------- Datos de receta --------------------
 
@@ -60,7 +50,7 @@ var (
 		"Jugo de verduras V8": 1.0,
 	}
 
-	// URLs de scraping
+	// URLs de scraping (Alsúper directo)
 	ingredientURLs = map[string]string{
 		"Pulpa de res picada": "https://alsuper.com/producto/pulpa-de-res-picada-357825",
 		"Tocino picado":       "https://alsuper.com/producto/tocineta-413218",
@@ -76,15 +66,11 @@ var (
 // -------------------- Modelos --------------------
 
 type scraperPrice struct {
-	URL           string   `json:"url"`
-	ProductName   *string  `json:"product_name,omitempty"`
-	PricePerKg    *float64 `json:"price_per_kg,omitempty"`   // para productos a granel O precio mostrado
-	UnitPrice     *float64 `json:"unit_price,omitempty"`     // para pieza/paquete/lata/six
-	UnitPackSize  *string  `json:"unit_pack_size,omitempty"` // no lo usamos, viene del scraper
-	UnitWeightG   *int     `json:"unit_weight_g,omitempty"`  // no lo usamos ahora
-	Currency      string   `json:"currency"`
-	RawUnit       string   `json:"raw_unit,omitempty"`       // "kg", "pza", etc (solo informativo)
-	OriginalPrice *float64 `json:"original_price,omitempty"` // si en algún momento se usa
+	URL        string   `json:"url"`
+	Product    *string  `json:"product_name,omitempty"`
+	PricePerKg *float64 `json:"price_per_kg,omitempty"` // para productos a granel
+	UnitPrice  *float64 `json:"unit_price,omitempty"`   // para pieza/paquete/lata/six
+	Currency   string   `json:"currency"`
 }
 
 type IngredientCalc struct {
@@ -116,7 +102,7 @@ type priceEntry struct {
 }
 
 var (
-	priceCache = make(map[string]priceEntry) // key: URL
+	priceCache = make(map[string]priceEntry) // key: URL de Alsúper
 	cacheMu    sync.RWMutex
 )
 
@@ -164,33 +150,110 @@ func round2(x float64) float64 {
 	return math.Round(x*100) / 100
 }
 
-func urlQueryEscape(s string) string {
-	return template.URLQueryEscaper(s)
+var priceRe = regexp.MustCompile(`\$[\s]*([0-9]+(?:\.[0-9]+)?)`)
+
+// extrae el precio del HTML de Alsúper usando las clases de precio
+func extractPriceFromHTML(html string) (float64, error) {
+	segment := html
+
+	// Intentar centrar el contexto en los spans de precio
+	if idx := strings.Index(html, "as-discount-price"); idx != -1 {
+		start := idx - 200
+		if start < 0 {
+			start = 0
+		}
+		end := idx + 200
+		if end > len(html) {
+			end = len(html)
+		}
+		segment = html[start:end]
+	} else if idx := strings.Index(html, "as-product-price"); idx != -1 {
+		start := idx - 200
+		if start < 0 {
+			start = 0
+		}
+		end := idx + 200
+		if end > len(html) {
+			end = len(html)
+		}
+		segment = html[start:end]
+	}
+
+	m := priceRe.FindStringSubmatch(segment)
+	if m == nil {
+		// fallback: buscar en todo el documento
+		m = priceRe.FindStringSubmatch(html)
+		if m == nil {
+			return 0, fmt.Errorf("no se encontró un precio con formato $123.45")
+		}
+	}
+
+	raw := strings.ReplaceAll(m[1], ",", "")
+	val, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return 0, fmt.Errorf("parseando precio %q: %w", raw, err)
+	}
+	return val, nil
 }
 
-// Llamada base al scraper (usa cache)
+// Llamada directa a Alsúper (SIN microservicio Python)
 func fetchPrice(ctx context.Context, url string) (*scraperPrice, error) {
+	// cache por URL de producto
 	if pr, ok := cacheGet(url); ok {
 		return pr, nil
 	}
-	req, _ := http.NewRequestWithContext(ctx, "GET", scraperBase+urlQueryEscape(url), nil)
+
+	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
+	if err != nil {
+		return nil, fmt.Errorf("creando request: %w", err)
+	}
+
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("llamando scraper: %w", err)
+		return nil, fmt.Errorf("llamando alsuper: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != 200 {
-		return nil, fmt.Errorf("scraper status %d", resp.StatusCode)
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("alsuper status %d", resp.StatusCode)
 	}
-	var pr scraperPrice
-	if err := json.NewDecoder(resp.Body).Decode(&pr); err != nil {
-		return nil, fmt.Errorf("decode json: %w", err)
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("leyendo body: %w", err)
 	}
-	cacheSet(url, &pr)
-	return &pr, nil
+
+	price, err := extractPriceFromHTML(string(body))
+	if err != nil {
+		return nil, err
+	}
+
+	// Determinar si es precio por Kg o por paquete según el ingrediente
+	name := ""
+	for n, u := range ingredientURLs {
+		if u == url {
+			name = n
+			break
+		}
+	}
+
+	pr := &scraperPrice{
+		URL:      url,
+		Currency: "MXN",
+	}
+
+	switch name {
+	case "Pulpa de res picada", "Tocino picado", "Jamon en cuadros", "Cebolla blanca":
+		pr.PricePerKg = &price
+	default:
+		pr.UnitPrice = &price
+	}
+
+	cacheSet(url, pr)
+	return pr, nil
 }
 
-// Reintentos con backoff
+// Reintentos con backoff suave
 func fetchWithRetry(ctx context.Context, url string, attempts int, baseDelay time.Duration) (*scraperPrice, error) {
 	var lastErr error
 	for i := 0; i < attempts; i++ {
@@ -208,6 +271,7 @@ func fetchWithRetry(ctx context.Context, url string, attempts int, baseDelay tim
 
 // -------------------- Cálculo --------------------
 
+// ¡OJO! Mantiene toda la lógica de proporciones que ya acordamos
 func calcFor(personas, gpp int) (*CalcResponse, error) {
 	if personas <= 0 || gpp <= 0 {
 		return nil, fmt.Errorf("personas y gramos por persona deben ser > 0")
@@ -234,16 +298,15 @@ func calcFor(personas, gpp int) (*CalcResponse, error) {
 	for _, nm := range names {
 		url := ingredientURLs[nm]
 
-		// Contexto con timeout para ESTE ingrediente
 		ctx, cancel := context.WithTimeout(context.Background(), perReqTimeout)
 		pr, err := fetchWithRetry(ctx, url, 3, 800*time.Millisecond)
 		cancel()
 		if err != nil {
-			// Esto es lo que ves en el <div class="toast">
+			log.Printf("calc error para %s: %v", nm, err)
 			return nil, fmt.Errorf("%s: %w", nm, err)
 		}
 
-		// Precios crudos del scraper
+		// Precios crudos
 		unitPrice := 0.0
 		if pr.UnitPrice != nil {
 			unitPrice = *pr.UnitPrice
@@ -285,12 +348,9 @@ func calcFor(personas, gpp int) (*CalcResponse, error) {
 			packs := ceilDiv(int(math.Round(gramsNeeded)), 800)
 			it.PurchasedUnits = packs
 
-			// Si unit_price viene vacío pero hay price_per_kg,
-			// tomar price_per_kg como unit_price (precio del paquete)
 			if it.UnitPrice <= 0 && it.PricePerKg > 0 {
 				it.UnitPrice = it.PricePerKg
 			}
-			// Columna Precio Por Kg vacía
 			it.PricePerKg = 0
 			it.Cost = round2(float64(packs) * it.UnitPrice)
 
@@ -418,6 +478,7 @@ const indexPageHTML = `<!doctype html>
       border-radius:10px;
       border:1px solid var(--border);
       background:#050505;
+      max-width:900px;
     }
     label{
       display:flex;
@@ -465,6 +526,7 @@ const indexPageHTML = `<!doctype html>
       border-radius:10px;
       overflow:hidden;
       border:1px solid var(--table-border);
+      max-width:900px;
     }
     th,td{
       padding:8px 10px;
@@ -497,6 +559,7 @@ const indexPageHTML = `<!doctype html>
       border-radius:8px;
       font-size:13px;
       border:1px solid #660000;
+      max-width:900px;
     }
     #resultado[aria-busy="true"]{
       opacity:0.6;
@@ -605,42 +668,42 @@ const indexPageHTML = `<!doctype html>
     <h3>Instrucciones</h3>
     <ol>
       <li><strong>Mise en Place (Preparación inicial)</strong><br>
-        Picar el tocino, la salchicha, el jamón (o sustituto) y la cebolla en cubos uniformes.  
+        Picar el tocino, la salchicha, el jamón (o sustituto) y la cebolla en cubos uniformes.<br>
         Reservar los ingredientes por separado.
       </li>
       <li><strong>Sofrito de carnes frías</strong><br>
-        Calentar un disco de arado (o sartén grande) y añadir el aceite de su preferencia.  
+        Calentar un disco de arado (o sartén grande) y añadir el aceite de su preferencia.<br>
         Incorporar las carnes frías (jamón, salchicha y tocino) y sofreír a fuego alto hasta que estén doradas.
       </li>
       <li><strong>Cocción de la carne de res</strong><br>
-        Agregar la pulpa de res a la mezcla.  
-        Sazonar con sal, pimienta o el sazón de su elección, considerando que posteriormente se añadirá puré o jugo de tomate.  
+        Agregar la pulpa de res a la mezcla.<br>
+        Sazonar con sal, pimienta o el sazón de su elección, considerando que posteriormente se añadirá puré o jugo de tomate.<br>
         Sofreír la carne hasta que el líquido o agua que suelta la pulpa se haya reducido casi por completo.
       </li>
       <li><strong>Reducción con líquidos</strong><br>
-        Verter la cerveza y el jugo de tomate (la mezcla debe quedar cubierta por completo).  
+        Verter la cerveza y el jugo de tomate (la mezcla debe quedar cubierta por completo).<br>
         Bajar el fuego a medio-bajo y cocinar, revolviendo ocasionalmente, hasta que el líquido se haya reducido y espese.
       </li>
       <li><strong>Adición del chorizo y la cebolla</strong><br>
-        Cuando el líquido restante sea espeso y esté bien adherido a las carnes, abrir un espacio en el centro y añadir el chorizo para que se deshaga y se cocine en los jugos restantes, una vez listo el chorizo, incorporar la cebolla cruda picada, mezclar y  
-        sofreír hasta que la cebolla esté tierna y translúcida.  
+        Cuando el líquido restante sea espeso y esté bien adherido a las carnes, abrir un espacio en el centro y añadir el chorizo para que se deshaga y se cocine en los jugos restantes; una vez listo el chorizo, incorporar la cebolla cruda picada, mezclar y<br>
+        sofreír hasta que la cebolla esté tierna y translúcida.<br>
         Rectificar la sazón final (sal, pimienta o sazonador).
       </li>
       <li><strong>Servir</strong><br>
-        Agregar el cilantro fresco picado.  
-        Servir la discada inmediatamente en tacos de maíz o harina.  
+        Agregar el cilantro fresco picado.<br>
+        Servir la discada inmediatamente en tacos de maíz o harina.<br>
         <small>Sugerencia: ~1 kg de tortillas por cada 8 personas.</small>
       </li>
     </ol>
 
     <h3>✨ Pasos opcionales y variaciones</h3>
     <p><strong>Opción Mar y Tierra</strong><br>
-      Para añadir camarón (Mar y Tierra), incorpore camarón pelado crudo y previamente sazonado al mismo tiempo que la cebolla.  
+      Para añadir camarón (Mar y Tierra), incorpore camarón pelado crudo y previamente sazonado al mismo tiempo que la cebolla.<br>
       Proporción recomendada: 1 kg de camarón por cada 2 kg de pulpa de res.
     </p>
     <p><strong>Adición de vegetales</strong><br>
-      Puede integrar chiles o pimientos picados.  
-      Añadir al mismo tiempo que la cebolla.  
+      Puede integrar chiles o pimientos picados.<br>
+      Añadir al mismo tiempo que la cebolla.<br>
       La cantidad de chiles/pimientos es 100% al gusto.
     </p>
     <p><strong>Sustitución de jamón</strong><br>
@@ -757,7 +820,7 @@ func main() {
 		gpp := atoiQ(c.PostForm("gpp"))
 		res, err := calcFor(personas, gpp)
 		if err != nil {
-			log.Println("calc error:", err)
+			c.Header("Content-Type", "text/html; charset=utf-8")
 			c.String(http.StatusBadRequest, `<div class="toast">Error: %s</div>`, template.HTMLEscapeString(err.Error()))
 			return
 		}
@@ -767,7 +830,7 @@ func main() {
 		}
 	})
 
-	// Endpoint JSON por si lo sigues usando
+	// Endpoint JSON original (por si lo sigues usando)
 	r.GET("/api/calc", func(c *gin.Context) {
 		personas := atoiQ(c.Query("personas"))
 		gpp := atoiQ(c.Query("gpp"))
