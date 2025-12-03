@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"html/template"
@@ -16,6 +17,7 @@ import (
 	"github.com/gin-gonic/gin"
 )
 
+// En producción (Render) apuntamos al scraper público HTTPS
 const scraperBase = "https://discada-scraper-1.onrender.com/price?url="
 
 // Timeout total por request al scraper (cada ingrediente)
@@ -24,9 +26,18 @@ const perReqTimeout = 60 * time.Second
 // Cache TTL de 5 minutos
 const cacheTTL = 5 * time.Minute
 
-var httpClient = &http.Client{Timeout: perReqTimeout}
+// Cliente HTTP con timeout y TLS relajado (para evitar error x509 en Render)
+var httpClient = &http.Client{
+	Timeout: perReqTimeout,
+	Transport: &http.Transport{
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true, // ⚠️ Acepta el certificado del scraper sin validarlo
+		},
+	},
+}
 
 // -------------------- Datos de receta --------------------
+
 var (
 	// Total receta base (solo se usa para escalar bebidas)
 	totalBaseGrams float64 = 2937.5
@@ -65,11 +76,15 @@ var (
 // -------------------- Modelos --------------------
 
 type scraperPrice struct {
-	URL         string   `json:"url"`
-	ProductName *string  `json:"product_name,omitempty"`
-	PricePerKg  *float64 `json:"price_per_kg,omitempty"` // para productos a granel O precio mostrado
-	UnitPrice   *float64 `json:"unit_price,omitempty"`   // para pieza/paquete/lata/six
-	Currency    string   `json:"currency"`
+	URL           string   `json:"url"`
+	ProductName   *string  `json:"product_name,omitempty"`
+	PricePerKg    *float64 `json:"price_per_kg,omitempty"`   // para productos a granel O precio mostrado
+	UnitPrice     *float64 `json:"unit_price,omitempty"`     // para pieza/paquete/lata/six
+	UnitPackSize  *string  `json:"unit_pack_size,omitempty"` // no lo usamos, viene del scraper
+	UnitWeightG   *int     `json:"unit_weight_g,omitempty"`  // no lo usamos ahora
+	Currency      string   `json:"currency"`
+	RawUnit       string   `json:"raw_unit,omitempty"`       // "kg", "pza", etc (solo informativo)
+	OriginalPrice *float64 `json:"original_price,omitempty"` // si en algún momento se usa
 }
 
 type IngredientCalc struct {
@@ -502,13 +517,14 @@ const indexPageHTML = `<!doctype html>
     }
     /* Sección de receta */
     .recipe{
-      margin:24px 0 0;
+      margin:24px auto 0;
       padding:16px 14px;
       border-radius:10px;
       border:1px solid var(--border);
       background:#050505;
       font-size:14px;
       line-height:1.5;
+      max-width:900px;
       box-sizing:border-box;
     }
     .recipe h2{
@@ -537,8 +553,8 @@ const indexPageHTML = `<!doctype html>
     }
     .farewell-img{
       display:block;
-      width:100%;           /* llena el ancho del card de receta */
-      max-width:100%;       /* nunca más que el contenedor */
+      width:100%;
+      max-width:100%;
       height:auto;
       border:2px solid var(--border);
       border-radius:10px;
@@ -603,42 +619,42 @@ const indexPageHTML = `<!doctype html>
     <h3>Instrucciones</h3>
     <ol>
       <li><strong>Mise en Place (Preparación inicial)</strong><br>
-        Picar el tocino, la salchicha, el jamón (o sustituto) y la cebolla en cubos uniformes.<br>
+        Picar el tocino, la salchicha, el jamón (o sustituto) y la cebolla en cubos uniformes.  
         Reservar los ingredientes por separado.
       </li>
       <li><strong>Sofrito de carnes frías</strong><br>
-        Calentar un disco de arado (o sartén grande) y añadir el aceite de su preferencia.<br>
+        Calentar un disco de arado (o sartén grande) y añadir el aceite de su preferencia.  
         Incorporar las carnes frías (jamón, salchicha y tocino) y sofreír a fuego alto hasta que estén doradas.
       </li>
       <li><strong>Cocción de la carne de res</strong><br>
-        Agregar la pulpa de res a la mezcla.<br>
-        Sazonar con sal, pimienta o el sazón de su elección, considerando que posteriormente se añadirá puré o jugo de tomate.<br>
+        Agregar la pulpa de res a la mezcla.  
+        Sazonar con sal, pimienta o el sazón de su elección, considerando que posteriormente se añadirá puré o jugo de tomate.  
         Sofreír la carne hasta que el líquido o agua que suelta la pulpa se haya reducido casi por completo.
       </li>
       <li><strong>Reducción con líquidos</strong><br>
-        Verter la cerveza y el jugo de tomate (la mezcla debe quedar cubierta por completo).<br>
+        Verter la cerveza y el jugo de tomate (la mezcla debe quedar cubierta por completo).  
         Bajar el fuego a medio-bajo y cocinar, revolviendo ocasionalmente, hasta que el líquido se haya reducido y espese.
       </li>
       <li><strong>Adición del chorizo y la cebolla</strong><br>
-        Cuando el líquido restante sea espeso y esté bien adherido a las carnes, abrir un espacio en el centro y añadir el chorizo para que se deshaga y se cocine en los jugos restantes; una vez listo el chorizo, incorporar la cebolla cruda picada, mezclar y<br>
-        sofreír hasta que la cebolla esté tierna y translúcida.<br>
+        Cuando el líquido restante sea espeso y esté bien adherido a las carnes, abrir un espacio en el centro y añadir el chorizo para que se deshaga y se cocine en los jugos restantes, una vez listo el chorizo, incorporar la cebolla cruda picada, mezclar y  
+        sofreír hasta que la cebolla esté tierna y translúcida.  
         Rectificar la sazón final (sal, pimienta o sazonador).
       </li>
       <li><strong>Servir</strong><br>
-        Agregar el cilantro fresco picado.<br>
-        Servir la discada inmediatamente en tacos de maíz o harina.<br>
+        Agregar el cilantro fresco picado.  
+        Servir la discada inmediatamente en tacos de maíz o harina.  
         <small>Sugerencia: ~1 kg de tortillas por cada 8 personas.</small>
       </li>
     </ol>
 
     <h3>✨ Pasos opcionales y variaciones</h3>
     <p><strong>Opción Mar y Tierra</strong><br>
-      Para añadir camarón (Mar y Tierra), incorpore camarón pelado crudo y previamente sazonado al mismo tiempo que la cebolla.<br>
+      Para añadir camarón (Mar y Tierra), incorpore camarón pelado crudo y previamente sazonado al mismo tiempo que la cebolla.  
       Proporción recomendada: 1 kg de camarón por cada 2 kg de pulpa de res.
     </p>
     <p><strong>Adición de vegetales</strong><br>
-      Puede integrar chiles o pimientos picados.<br>
-      Añadir al mismo tiempo que la cebolla.<br>
+      Puede integrar chiles o pimientos picados.  
+      Añadir al mismo tiempo que la cebolla.  
       La cantidad de chiles/pimientos es 100% al gusto.
     </p>
     <p><strong>Sustitución de jamón</strong><br>
@@ -755,6 +771,7 @@ func main() {
 		gpp := atoiQ(c.PostForm("gpp"))
 		res, err := calcFor(personas, gpp)
 		if err != nil {
+			log.Println("calc error:", err)
 			c.String(http.StatusBadRequest, `<div class="toast">Error: %s</div>`, template.HTMLEscapeString(err.Error()))
 			return
 		}
@@ -764,7 +781,7 @@ func main() {
 		}
 	})
 
-	// Endpoint JSON original (por si lo sigues usando)
+	// Endpoint JSON por si lo sigues usando
 	r.GET("/api/calc", func(c *gin.Context) {
 		personas := atoiQ(c.Query("personas"))
 		gpp := atoiQ(c.Query("gpp"))
