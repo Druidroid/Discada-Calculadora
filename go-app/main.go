@@ -271,7 +271,7 @@ func fetchWithRetry(ctx context.Context, url string, attempts int, baseDelay tim
 
 // -------------------- Cálculo --------------------
 
-// ¡OJO! Mantiene toda la lógica de proporciones que ya acordamos
+// Mantiene toda la lógica de proporciones que ya acordamos
 func calcFor(personas, gpp int) (*CalcResponse, error) {
 	if personas <= 0 || gpp <= 0 {
 		return nil, fmt.Errorf("personas y gramos por persona deben ser > 0")
@@ -436,7 +436,7 @@ func calcFor(personas, gpp int) (*CalcResponse, error) {
 
 // -------------------- Plantillas HTMX --------------------
 
-// Página principal con HTMX (tema MS-DOS negro/naranja)
+// Página principal con HTMX (tema MS-DOS negro/naranja) + acordeones
 const indexPageHTML = `<!doctype html>
 <html lang="es">
 <head>
@@ -457,17 +457,29 @@ const indexPageHTML = `<!doctype html>
       --error-fg: #ff7043;
     }
     * { box-sizing: border-box; }
+    html, body {
+      margin: 0;
+      padding: 0;
+      background: var(--bg);
+      color: var(--fg);
+    }
     body{
       font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Helvetica,Arial,sans-serif;
-      max-width:1100px;
-      margin:40px auto;
+    }
+    .page{
+      max-width:900px;
+      margin:24px auto 40px;
       padding:0 12px;
-      background:var(--bg);
-      color:var(--fg);
     }
     a{ color:var(--fg-soft); text-decoration:none; }
     a:hover{ text-decoration:underline; }
-    h1{ margin-top:0; color:var(--fg-soft); }
+    h1{
+      margin-top:0;
+      margin-bottom:16px;
+      color:var(--fg-soft);
+      text-align:left;
+      font-size:1.6rem;
+    }
     form{
       display:flex;
       gap:12px;
@@ -478,7 +490,7 @@ const indexPageHTML = `<!doctype html>
       border-radius:10px;
       border:1px solid var(--border);
       background:#050505;
-      max-width:900px;
+      width:100%;
     }
     label{
       display:flex;
@@ -526,7 +538,6 @@ const indexPageHTML = `<!doctype html>
       border-radius:10px;
       overflow:hidden;
       border:1px solid var(--table-border);
-      max-width:900px;
     }
     th,td{
       padding:8px 10px;
@@ -559,11 +570,12 @@ const indexPageHTML = `<!doctype html>
       border-radius:8px;
       font-size:13px;
       border:1px solid #660000;
-      max-width:900px;
+      width:100%;
     }
     #resultado[aria-busy="true"]{
       opacity:0.6;
     }
+
     /* Sección de receta */
     .recipe{
       margin:24px auto 0;
@@ -573,32 +585,65 @@ const indexPageHTML = `<!doctype html>
       background:#050505;
       font-size:14px;
       line-height:1.5;
-      max-width:900px;
+      width:100%;
       box-sizing:border-box;
     }
     .recipe h2{
       margin:0 0 10px 0;
       color:var(--fg-soft);
       font-size:18px;
+      text-align:left;
     }
-    .recipe h3{
-      margin:14px 0 6px 0;
+
+    /* Acordeones */
+    .accordion{
+      border:1px solid var(--border);
+      border-radius:8px;
+      padding:10px 12px;
+      background:#050505;
+      margin-bottom:10px;
+    }
+    .accordion[open]{
+      background:#0a0a0a;
+    }
+    .accordion > summary{
+      list-style:none;
+      cursor:pointer;
+      font-weight:600;
       color:var(--fg-soft);
-      font-size:15px;
+      display:flex;
+      justify-content:space-between;
+      align-items:center;
+      font-size:14px;
     }
-    .recipe ul,
-    .recipe ol{
+    .accordion > summary::-webkit-details-marker{
+      display:none;
+    }
+    .accordion summary::after{
+      content:"▾";
+      font-size:0.8rem;
+    }
+    .accordion[open] summary::after{
+      content:"▴";
+    }
+    .accordion-content{
+      margin-top:8px;
+      font-size:14px;
+    }
+    .accordion-content ul,
+    .accordion-content ol{
       padding-left:18px;
       margin:4px 0 10px;
     }
-    .recipe li{
+    .accordion-content li{
       margin-bottom:4px;
     }
-    .recipe small{
+    .accordion-content small{
       opacity:0.85;
     }
+
     .farewell{
-      margin-top:20px;
+      margin-top:16px;
     }
     .farewell-img{
       display:block;
@@ -609,111 +654,141 @@ const indexPageHTML = `<!doctype html>
       border-radius:10px;
       image-rendering:pixelated;
     }
+
     @media (max-width: 600px){
-      body{
-        margin:20px auto;
+      .page{
+        margin:16px auto 28px;
         padding:0 8px;
+      }
+      h1{
+        font-size:1.3rem;
+        text-align:center;
       }
       form{
         flex-direction:column;
         align-items:stretch;
+        gap:8px;
       }
       button{
         width:100%;
         text-align:center;
       }
+      th,td{
+        font-size:12px;
+        padding:6px;
+      }
+      .recipe{
+        padding:12px 10px;
+      }
+      .accordion{
+        padding:8px 10px;
+      }
     }
   </style>
 </head>
 <body>
-  <h1>Calculadora de Discada Norteña - ccDN.1</h1>
+  <div class="page">
+    <h1>Calculadora de Discada Norteña - ccDN.1</h1>
 
-  <form id="calcForm"
-        hx-post="/hx/calc"
-        hx-target="#resultado"
-        hx-swap="innerHTML"
-        hx-indicator="#spinner"
-        hx-trigger="submit, keyup changed delay:500ms from:#personas from:#gpp">
-    <label>Personas
-      <input id="personas" name="personas" type="number" value="10" min="1" required>
-    </label>
-    <label>Gramos por persona
-      <input id="gpp" name="gpp" type="number" value="250" min="50" step="10" required>
-    </label>
-    <button type="submit" id="btnCalc">Calcular</button>
-    <span id="spinner" class="spinner" style="display:none;">Calculando…</span>
-  </form>
+    <form id="calcForm"
+          hx-post="/hx/calc"
+          hx-target="#resultado"
+          hx-swap="innerHTML"
+          hx-indicator="#spinner"
+          hx-trigger="submit, keyup changed delay:500ms from:#personas from:#gpp">
+      <label>Personas
+        <input id="personas" name="personas" type="number" value="10" min="1" required>
+      </label>
+      <label>Gramos por persona
+        <input id="gpp" name="gpp" type="number" value="250" min="50" step="10" required>
+      </label>
+      <button type="submit" id="btnCalc">Calcular</button>
+      <span id="spinner" class="spinner" style="display:none;">Calculando…</span>
+    </form>
 
-  <div id="resultado" aria-live="polite" aria-busy="false">
-    <!-- Aquí HTMX inyecta la tabla -->
-  </div>
-
-  <section class="recipe">
-    <h2>🍽️ Preparación de la Discada</h2>
-
-    <h3>Ingredientes (Proporciones base)</h3>
-    <ul>
-      <li>Tocineta (Tocino a granel)</li>
-      <li>Salchicha para asar</li>
-      <li>Jamón de pierna (o sustituto como chuleta/lomo de cerdo ahumado)</li>
-      <li>Cebolla</li>
-      <li>Pulpa de res picada (carne de res para guisar)</li>
-      <li>Aceite de su preferencia</li>
-      <li>Sal y pimienta (o sazonador al gusto)</li>
-      <li>Cerveza</li>
-      <li>Jugo de tomate (puré de tomate o jugo de verduras)</li>
-      <li>Cilantro fresco</li>
-    </ul>
-
-    <h3>Instrucciones</h3>
-    <ol>
-      <li><strong>Mise en Place (Preparación inicial)</strong><br>
-        Picar el tocino, la salchicha, el jamón (o sustituto) y la cebolla en cubos uniformes.<br>
-        Reservar los ingredientes por separado.
-      </li>
-      <li><strong>Sofrito de carnes frías</strong><br>
-        Calentar un disco de arado (o sartén grande) y añadir el aceite de su preferencia.<br>
-        Incorporar las carnes frías (jamón, salchicha y tocino) y sofreír a fuego alto hasta que estén doradas.
-      </li>
-      <li><strong>Cocción de la carne de res</strong><br>
-        Agregar la pulpa de res a la mezcla.<br>
-        Sazonar con sal, pimienta o el sazón de su elección, considerando que posteriormente se añadirá puré o jugo de tomate.<br>
-        Sofreír la carne hasta que el líquido o agua que suelta la pulpa se haya reducido casi por completo.
-      </li>
-      <li><strong>Reducción con líquidos</strong><br>
-        Verter la cerveza y el jugo de tomate (la mezcla debe quedar cubierta por completo).<br>
-        Bajar el fuego a medio-bajo y cocinar, revolviendo ocasionalmente, hasta que el líquido se haya reducido y espese.
-      </li>
-      <li><strong>Adición del chorizo y la cebolla</strong><br>
-        Cuando el líquido restante sea espeso y esté bien adherido a las carnes, abrir un espacio en el centro y añadir el chorizo para que se deshaga y se cocine en los jugos restantes; una vez listo el chorizo, incorporar la cebolla cruda picada, mezclar y<br>
-        sofreír hasta que la cebolla esté tierna y translúcida.<br>
-        Rectificar la sazón final (sal, pimienta o sazonador).
-      </li>
-      <li><strong>Servir</strong><br>
-        Agregar el cilantro fresco picado.<br>
-        Servir la discada inmediatamente en tacos de maíz o harina.<br>
-        <small>Sugerencia: ~1 kg de tortillas por cada 8 personas.</small>
-      </li>
-    </ol>
-
-    <h3>✨ Pasos opcionales y variaciones</h3>
-    <p><strong>Opción Mar y Tierra</strong><br>
-      Para añadir camarón (Mar y Tierra), incorpore camarón pelado crudo y previamente sazonado al mismo tiempo que la cebolla.<br>
-      Proporción recomendada: 1 kg de camarón por cada 2 kg de pulpa de res.
-    </p>
-    <p><strong>Adición de vegetales</strong><br>
-      Puede integrar chiles o pimientos picados.<br>
-      Añadir al mismo tiempo que la cebolla.<br>
-      La cantidad de chiles/pimientos es 100% al gusto.
-    </p>
-    <p><strong>Sustitución de jamón</strong><br>
-      El jamón puede ser reemplazado por chuletas o lomo de cerdo ahumado picado.
-    </p>
-
-    <div class="farewell">
-      <img src="/static/eldorado.png" alt="Desierto pixel art" class="farewell-img">
+    <div id="resultado" aria-live="polite" aria-busy="false">
+      <!-- Aquí HTMX inyecta la tabla -->
     </div>
-  </section>
+
+    <section class="recipe">
+      <h2>🍽️ Preparación de la Discada</h2>
+
+      <details class="accordion" open>
+        <summary>Ingredientes (proporciones base)</summary>
+        <div class="accordion-content">
+          <ul>
+            <li>Tocineta (Tocino a granel)</li>
+            <li>Salchicha para asar</li>
+            <li>Jamón de pierna (o sustituto como chuleta/lomo de cerdo ahumado)</li>
+            <li>Cebolla</li>
+            <li>Pulpa de res picada (carne de res para guisar)</li>
+            <li>Aceite de su preferencia</li>
+            <li>Sal y pimienta (o sazonador al gusto)</li>
+            <li>Cerveza</li>
+            <li>Jugo de tomate (puré de tomate o jugo de verduras)</li>
+            <li>Cilantro fresco</li>
+          </ul>
+        </div>
+      </details>
+
+      <details class="accordion">
+        <summary>Instrucciones</summary>
+        <div class="accordion-content">
+          <ol>
+            <li><strong>Mise en Place (Preparación inicial)</strong><br>
+              Picar el tocino, la salchicha, el jamón (o sustituto) y la cebolla en cubos uniformes.<br>
+              Reservar los ingredientes por separado.
+            </li>
+            <li><strong>Sofrito de carnes frías</strong><br>
+              Calentar un disco de arado (o sartén grande) y añadir el aceite de su preferencia.<br>
+              Incorporar las carnes frías (jamón, salchicha y tocino) y sofreír a fuego alto hasta que estén doradas.
+            </li>
+            <li><strong>Cocción de la carne de res</strong><br>
+              Agregar la pulpa de res a la mezcla.<br>
+              Sazonar con sal, pimienta o el sazón de su elección, considerando que posteriormente se añadirá puré o jugo de tomate.<br>
+              Sofreír la carne hasta que el líquido o agua que suelta la pulpa se haya reducido casi por completo.
+            </li>
+            <li><strong>Reducción con líquidos</strong><br>
+              Verter la cerveza y el jugo de tomate (la mezcla debe quedar cubierta por completo).<br>
+              Bajar el fuego a medio-bajo y cocinar, revolviendo ocasionalmente, hasta que el líquido se haya reducido y espese.
+            </li>
+            <li><strong>Adición del chorizo y la cebolla</strong><br>
+              Cuando el líquido restante sea espeso y esté bien adherido a las carnes, abrir un espacio en el centro y añadir el chorizo para que se deshaga y se cocine en los jugos restantes; una vez listo el chorizo, incorporar la cebolla cruda picada, mezclar y<br>
+              sofreír hasta que la cebolla esté tierna y translúcida.<br>
+              Rectificar la sazón final (sal, pimienta o sazonador).
+            </li>
+            <li><strong>Servir</strong><br>
+              Agregar el cilantro fresco picado.<br>
+              Servir la discada inmediatamente en tacos de maíz o harina.<br>
+              <small>Sugerencia: ~1 kg de tortillas por cada 8 personas.</small>
+            </li>
+          </ol>
+        </div>
+      </details>
+
+      <details class="accordion">
+        <summary>Pasos opcionales y variaciones</summary>
+        <div class="accordion-content">
+          <p><strong>Opción Mar y Tierra</strong><br>
+            Para añadir camarón (Mar y Tierra), incorpore camarón pelado crudo y previamente sazonado al mismo tiempo que la cebolla.<br>
+            Proporción recomendada: 1 kg de camarón por cada 2 kg de pulpa de res.
+          </p>
+          <p><strong>Adición de vegetales</strong><br>
+            Puede integrar chiles o pimientos picados.<br>
+            Añadir al mismo tiempo que la cebolla.<br>
+            La cantidad de chiles/pimientos es 100% al gusto.
+          </p>
+          <p><strong>Sustitución de jamón</strong><br>
+            El jamón puede ser reemplazado por chuletas o lomo de cerdo ahumado picado.
+          </p>
+        </div>
+      </details>
+
+      <div class="farewell">
+        <img src="/static/eldorado.png" alt="Desierto pixel art" class="farewell-img">
+      </div>
+    </section>
+  </div>
 
   <script>
     // Cambiar texto del botón a "Calculando…" mientras HTMX hace la petición
